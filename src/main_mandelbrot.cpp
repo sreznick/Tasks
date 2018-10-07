@@ -8,6 +8,8 @@
 
 #include "cl/mandelbrot_cl.h"
 
+const float threshold = 256.0f;
+const float threshold2 = threshold * threshold;
 
 void mandelbrotCPU(float* results,
                    unsigned int width, unsigned int height,
@@ -15,9 +17,9 @@ void mandelbrotCPU(float* results,
                    float sizeX, float sizeY,
                    unsigned int iters, bool smoothing)
 {
-    const float threshold = 256.0f;
-    const float threshold2 = threshold * threshold;
-    
+    //const float threshold = 256.0f;
+    //const float threshold2 = threshold * threshold;
+
     #pragma omp parallel for
     for (int j = 0; j < height; ++j) {
         for (int i = 0; i < width; ++i) {
@@ -54,6 +56,7 @@ void renderInWindow(float centralX, float centralY, unsigned int iterationsLimit
 
 int main(int argc, char **argv)
 {
+    std::cout << "MMMM" << std::endl;
     gpu::Device device = gpu::chooseGPUDevice(argc, argv);
 
     unsigned int benchmarkingIters = 10;
@@ -106,13 +109,13 @@ int main(int argc, char **argv)
     }
 
 
-//    // Раскомментируйте это:
-//
-//    gpu::Context context;
-//    context.init(device.device_id_opencl);
-//    context.activate();
-//    {
-//        ocl::Kernel kernel(mandelbrot_kernel, mandelbrot_kernel_length, "mandelbrot");
+    // Раскомментируйте это:
+
+    gpu::Context context;
+    context.init(device.device_id_opencl);
+    context.activate();
+    {
+        ocl::Kernel kernel(mandelbrot_kernel, mandelbrot_kernel_length, "mandelbrot");
 //        // Если у вас есть интеловский драйвер для запуска на процессоре - попробуйте запустить на нем и взгляние на лог,
 //        // передав printLog=true - скорее всего в логе будет строчка вроде
 //        // Kernel <mandelbrot> was successfully vectorized (8)
@@ -120,26 +123,80 @@ int main(int argc, char **argv)
 //        // это означает что одно ядро процессит сразу 8 workItems, а т.к. все вычисления в float,
 //        // то это означает что используются 8 x float регистры (т.е. 256-битные, т.е. AVX)
 //        // обратите внимание что и произвдительность относительно референсной ЦПУ реализации выросла почти в восемь раз
-//        bool printLog = false;
-//        kernel.compile(printLog);
+        bool printLog = false;
+        kernel.compile(printLog);
+
+        // Создаем три буфера в видеопамяти
+        gpu::gpu_mem_32f buffer_gpu;
+        buffer_gpu.resizeN(width * height);
+
+        unsigned int workGroupSize = 128;
+        int n = width * height;
+        unsigned int global_work_size = (n + workGroupSize - 1) / workGroupSize * workGroupSize;
+
+        timer t; 
+        for (int i = 0; i < benchmarkingIters; ++i) {
+            kernel.exec(gpu::WorkSize(workGroupSize, global_work_size), buffer_gpu, width, height,
+                                 centralX - sizeX / 2.0f, centralY - sizeY / 2.0f, sizeX, sizeY, iterationsLimit, threshold, 0);
+
+
+            t.nextLap();
+        }
+
+//        kernel.exec(gpu::WorkSize(workGroupSize, global_work_size), buffer_gpu, width, height, 
+//                                 centralX - sizeX / 2.0f, centralY - sizeY / 2.0f, sizeX, sizeY, iterationsLimit, threshold, 0);
+
+        std::vector<float> result(n, 0);
+
+        buffer_gpu.readN(result.data(), n);
+        buffer_gpu.readN(gpu_results.ptr(), n);
+
+
+       size_t flopsInLoop = 10;
+        size_t maxApproximateFlops = width * height * iterationsLimit * flopsInLoop;
+        size_t gflops = 1000*1000*1000;
+        std::cout << "GPU: " << t.lapAvg() << "+-" << t.lapStd() << " s" << std::endl;
+        std::cout << "GPU: " << maxApproximateFlops / gflops / t.lapAvg() << " GFlops" << std::endl;
+
+        double realIterationsFraction = 0.0;
+        for (int j = 0; j < height; ++j) {
+            for (int i = 0; i < width; ++i) {
+                realIterationsFraction += cpu_results.ptr()[j * width + i];
+            }
+        }
+        std::cout << "    Real iterations fraction: " << 100.0 * realIterationsFraction / (width * height) << "%" << std::endl;
+
+        renderToColor(cpu_results.ptr(), image.ptr(), width, height);
+        image.savePNG("mandelbrot_cpu.png");
+
+
 //        // TODO близко к ЦПУ-версии, включая рассчет таймингов, гигафлопс, Real iterations fraction и сохранение в файл
 //        // результат должен оказаться в gpu_results
-//    }
+    }
 //
-//    {
-//        double errorAvg = 0.0;
-//        for (int j = 0; j < height; ++j) {
-//            for (int i = 0; i < width; ++i) {
-//                errorAvg += fabs(gpu_results.ptr()[j * width + i] - cpu_results.ptr()[j * width + i]);
-//            }
-//        }
-//        errorAvg /= width * height;
-//        std::cout << "GPU vs CPU average results difference: " << 100.0 * errorAvg << "%" << std::endl;
-//
-//        if (errorAvg > 0.03) {
-//            throw std::runtime_error("Too high difference between CPU and GPU results!");
-//        }
-//    }
+    {
+        double errorAvg = 0.0;
+        bool stop = false;
+        for (int j = 0; j < height; ++j) {
+            for (int i = 0; i < width; ++i) {
+                float d = fabs(gpu_results.ptr()[j * width + i] - cpu_results.ptr()[j * width + i]);
+                if (d > 0.03) {
+                    //std::cout << i << ", " << j << std::endl;
+                    //stop = true;
+                    //break;
+                }
+                if (stop) break;
+                errorAvg += fabs(gpu_results.ptr()[j * width + i] - cpu_results.ptr()[j * width + i]);
+            }
+            if (stop) break;
+        }
+        errorAvg /= width * height;
+        std::cout << "GPU vs CPU average results difference: " << 100.0 * errorAvg << "%" << std::endl;
+
+        if (errorAvg > 0.03) {
+            throw std::runtime_error("Too high difference between CPU and GPU results!");
+        }
+    }
 
     // Это бонус ввиде интерактивной отрисовки, не забудьте запустить на ГПУ чтобы посмотреть в какой момент числа итераций/точности single float перестанет хватать
     // Кликами мышки можно смещать ракурс
